@@ -1,0 +1,123 @@
+<script>
+/**
+ * PVE Attribution Capture, GTM Custom HTML
+ *
+ * Role:
+ *   On every pageview, persist raw attribution data (UTMs, referrer,
+ *   landing page, gclid) to first-party cookies + localStorage. The
+ *   PVE Identify tag reads these later at email capture and POSTs
+ *   raw values to the Cloudflare Worker, where transformations happen.
+ *
+ * Server-side (Worker) handles:
+ *   - Channel inference (cpc -> "Paid Search", etc.)
+ *   - User Agent parse (OS + browser)
+ *   - _ga cookie split (extract inner value for GA Client ID)
+ *   - Geo (Country, City, Lat, Lon, Timezone via Cloudflare request.cf)
+ *
+ * Cookies written (cookie + localStorage dual persistence for resilience
+ * against ITP / 3rd-party blocking / cookie quota issues):
+ *
+ *   pve_fc_{source,medium,campaign,content,term,referrer,landing_page}
+ *     30 days, write-once. "First click" attribution, locked on the
+ *     visitor's very first UTM'd landing in the 30d window.
+ *
+ *   pve_lc_{source,medium,campaign,content,term,referrer,landing_page}
+ *     7 days, overwrite. "Last click" attribution, refreshed on every
+ *     UTM'd landing within the 7d window.
+ *
+ *   pve_gclid
+ *     90 days, overwrite. Captured independently of UTMs (Google
+ *     auto-tagging can pass gclid alone on Paid Search landings).
+ *     Matches Google's gclid validity window for Enhanced Conversions.
+ *
+ * Trigger: All Pages.
+ * Coexists with Tag 68 (Senka, namespace first_click_/last_click_) and
+ * with the legacy kdi_* tag's residual cookies until they expire.
+ */
+
+(function () {
+
+  /* -------- Helpers -------- */
+
+  function getParam(key) {
+    return new URLSearchParams(location.search).get(key) || '';
+  }
+
+  function setCookie(name, value, days) {
+    var exp = new Date(Date.now() + days * 864e5).toUTCString();
+    var secure = location.protocol === 'https:' ? '; Secure' : '';
+    document.cookie = name + '=' + encodeURIComponent(value)
+      + '; path=/; expires=' + exp + '; SameSite=Lax' + secure;
+  }
+
+  /* Dual write: cookie for cross-tab availability, localStorage as a   */
+  /* fallback when cookies are blocked (3rd-party context, ITP, quota). */
+  /* Either failure is silent: never break the page for a tracking tag. */
+  function setItem(key, value, days) {
+    try { setCookie(key, value, days); } catch (e) {}
+    try { localStorage.setItem(key, value); } catch (e) {}
+  }
+
+  /* Returns true if the key exists in cookie OR localStorage.          */
+  /* Used to enforce write-once semantics on first-click cookies.       */
+  function hasItem(key) {
+    try {
+      if (document.cookie.indexOf(key + '=') !== -1) return true;
+      if (localStorage.getItem(key)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  /* -------- Attribution capture -------- */
+
+  /* Guard: only write attribution cookies when the current URL has at  */
+  /* least one utm_* param. Internal navigation (no UTMs) leaves the    */
+  /* existing fc/lc cookies untouched, preserving real attribution.     */
+
+  var utms = ['source', 'medium', 'campaign', 'content', 'term'];
+  var values = {};
+  var hasUtm = false;
+
+  for (var i = 0; i < utms.length; i++) {
+    values[utms[i]] = getParam('utm_' + utms[i]);
+    if (values[utms[i]]) hasUtm = true;
+  }
+
+  if (hasUtm) {
+
+    /* fc: write-once. lc: overwrite on every UTM'd landing. */
+    for (var j = 0; j < utms.length; j++) {
+      var k = utms[j];
+      if (!hasItem('pve_fc_' + k)) {
+        setItem('pve_fc_' + k, values[k], 30);
+      }
+      setItem('pve_lc_' + k, values[k], 7);
+    }
+
+    /* Referrer: stored raw. Worker uses it for channel inference       */
+    /* (e.g., empty referrer + no source -> "Direct").                  */
+    var ref = document.referrer || '';
+    if (!hasItem('pve_fc_referrer')) {
+      setItem('pve_fc_referrer', ref, 30);
+    }
+    setItem('pve_lc_referrer', ref, 7);
+
+    /* Landing page: full URL including query string, matches GA        */
+    /* Connector behavior (lead 131454 reference). Worker stores raw.   */
+    var landingPage = location.href;
+    if (!hasItem('pve_fc_landing_page')) {
+      setItem('pve_fc_landing_page', landingPage, 30);
+    }
+    setItem('pve_lc_landing_page', landingPage, 7);
+  }
+
+  /* GCLID: captured outside the hasUtm guard because Google Ads        */
+  /* auto-tagging can append gclid to a landing URL without any utm_*.  */
+  /* For Enhanced Conversions, latest gclid wins (matches GA Connector).*/
+  var gclid = getParam('gclid');
+  if (gclid) {
+    setCookie('pve_gclid', gclid, 90);
+  }
+
+})();
+</script>
