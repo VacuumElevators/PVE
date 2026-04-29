@@ -1,0 +1,23 @@
+name = "pve-attribution"
+main = "src/index.js"
+compatibility_date = "2026-04-29"
+account_id = "88e1f2086c7f8374a511a893996e8ace"
+workers_dev = false
+
+[[routes]]
+pattern = "ss.vacuumelevators.com"
+custom_domain = true
+zone_name = "vacuumelevators.com"
+
+[[kv_namespaces]]
+binding = "PVE_KV"
+id = "b744dfd6a418416a8a08bfc4412d7d4b"
+preview_id = "d6734a7eae4444d7a7b5e831ba2b36cd"
+
+# Secrets are set via `wrangler secret put` (later sub-step):
+#   wrangler secret put TURNSTILE_SECRET
+#   wrangler secret put HMAC_SECRET
+
+# Custom domain configured in dashboard under
+# Workers & Pages > pve-attribution > Settings > Domains & Routes.
+# Target: ss.vacuumelevators.com
