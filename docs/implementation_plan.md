@@ -33,13 +33,17 @@ Browser (vacuumelevators.com)
 
 ## Implementation steps (priority order)
 
+Ordering optimizes for **rollout quality**, not construction order. The GTM listener is published before Deluge is wired so the KV starts accumulating attribution data while later steps are built. Workflow Rules go live last, against an already-warm KV. There is no separate backfill from legacy `KDI_*` fields: Leads created before the GTM publish stay with empty `pve_*` (acceptable; if needed, a one-shot `dailySweep` with a wider window can catch warmup-era Leads after Step 7).
+
 1. **Cloudflare infra.** Worker, KV namespace, DNS CNAME `ss.vacuumelevators.com`, Turnstile site key + secret.
-2. **Worker code + GitHub Actions deploy.** `POST /identify`, `GET /lookup`, `DELETE /identify`. Auto-deploy on push to `main` with lint + smoke test gates.
-3. **Zoho custom fields.** Create 23 `pve_*` fields in Leads + Contacts modules. Verify Lead → Contact field type symmetry. Configure Lead Conversion Mapping (23 pairs).
-4. **Backfill Deluge function.** Additive and idempotent: for each existing Lead with `KDI_*` populated, copy 1:1 into matching `pve_*` field only when the target is empty.
-5. **Enrichment Deluge function.** `enrichLeadFromKV(leadId)` with kill switch and idempotency fence.
-6. **Workflow Rules + scheduled function.** Rule 1 on Lead Create. Rule 2 on Email field modified. Scheduled daily sweep at 03:00 UTC.
-7. **GTM PVE Identify tag.** Universal email listener (no per-form configuration). Validate in Preview, publish.
+2. **Worker code + GitHub Actions deploy.** `POST /identify`, `GET /lookup`, `DELETE /identify`. Auto-deploy on push to `main` with lint + smoke test gates. Observability counters wired in this step so they are live from Step 3 onwards.
+3. **GTM PVE Identify tag publish.** Universal email listener (no per-form configuration). Verify cookie banner consent category mapping matches the existing `pve_attribution_unified` tag. Validate in Preview, publish. KV warmup begins; observability live.
+4. **Zoho custom fields.** Create 23 `pve_*` fields in Leads + Contacts modules. Verify Lead → Contact field type symmetry. Configure Lead Conversion Mapping (23 pairs). Runs in parallel with Step 3 (independent of KV).
+5. **Enrichment Deluge function written.** `enrichLeadFromKV(leadId)` with kill switch (`ENRICH_ENABLED`) and idempotency fence. Function exists in Zoho but is **not** wired to any Workflow Rule yet.
+6. **Manual smoke test.** Two pre-flight checks before automation:
+   - **Email-hash handshake:** browser-side `crypto.subtle.digest('SHA-256', email.toLowerCase().trim())` MUST produce the identical hex output as Deluge `zoho.encryption.sha256(email, "hex")` for the same input. Validate explicitly with at least three test emails.
+   - **End-to-end single-Lead enrichment:** create one test Lead, manually invoke `enrichLeadFromKV(test_lead_id)`, verify all 23 `pve_*` fields populate correctly. Re-run, verify fence returns `"already populated"`. Set `ENRICH_ENABLED=false`, re-run, verify returns `"disabled"`.
+7. **Workflow Rules + scheduled sweep (big-bang).** Three rules ship together: Rule 1 on Lead Create, Rule 2 on Email field modified, Scheduled daily sweep at 03:00 UTC. Real-time enrichment goes live the moment this step lands.
 
 ---
 
@@ -48,6 +52,8 @@ Browser (vacuumelevators.com)
 ### 1. GTM PVE Identify tag (universal capture)
 
 Custom HTML tag, fires on All Pages. Captures email across **any** form on the site without per-form configuration (matches GA Connector's behavior).
+
+**Consent gating (verify before publish):** the existing `pve_attribution_unified` tag (which sets cookies) is already mapped to a category in the cookie banner. The new Identify tag MUST map to the same category. If the existing tag is gated by "marketing" / "analytics" / equivalent, gate this one identically. Skipping this is a GDPR risk: capturing `email_hash` from EU visitors without consent.
 
 Document-level listeners:
 - `change` on `input[type=email]`: catches email on field blur
@@ -220,12 +226,9 @@ Verification before Conversion Mapping: confirm each Lead field and its Contact 
 3. Cap at 500 Leads per run.
 4. After run: if backlog (Leads still empty after sweep) > 100, log alert.
 
-#### `backfill()` (one-time, manual run)
-1. Iterate all Leads with any `KDI_*` field populated.
-2. For each `pve_*` target field, write only if currently empty (additive; protects against overwrite during parallel run).
-3. 1:1 mapping for the 14 cookie-derived fields. The 9 Worker/Cloudflare-derived fields stay empty for historical Leads (cannot be reconstructed).
-4. **Allowlist guardrail:** every key in the update Map MUST match `^pve_`. If any key fails, abort the Lead update and log.
-5. Idempotent: re-running on partial completion only fills missing fields.
+**Wider-window catch-up:** for the one-time recovery of warmup-era Leads (created between GTM publish and Workflow Rule 1 going live), `dailySweep` can be invoked once with a wider COQL window (e.g. `Created_Time > <GTM publish date>`). Same function, just a parameter override on the manual invocation.
+
+There is no separate backfill function. The previous design migrated `KDI_*` legacy fields into `pve_*`; that bridge has been dropped (decision 2026-04-30: `KDI_*` is not in use, legacy Leads stay with empty `pve_*`).
 
 ### 6. Workflow Rules
 
@@ -246,7 +249,13 @@ Secrets:
 - Cloudflare Worker: `TURNSTILE_SECRET`, `HMAC_SECRET` (set via `wrangler secret put`)
 - Zoho Org Variables: `WORKER_HMAC_SECRET` (mirror of `HMAC_SECRET`), `ENRICH_ENABLED` (boolean kill switch)
 
-Smoke test before go-live: send signed Deluge → Worker request, verify HMAC validates on both ends. Most common failure: Zoho org timezone vs Worker UTC drift. Use `zoho.currenttime.toString("...","UTC")` explicitly and parse to epoch ms.
+Smoke tests before automation (Step 6):
+
+1. **Email-hash handshake.** Browser `crypto.subtle.digest('SHA-256', email.toLowerCase().trim())` and Deluge `zoho.encryption.sha256(email, "hex")` MUST produce identical 64-char hex output for the same input. Test at least three emails covering: lowercase, mixed case + leading/trailing whitespace, non-ASCII characters. Mismatch = silent 100% lookup failure in production.
+
+2. **Signed request handshake.** Send signed Deluge → Worker request, verify HMAC validates on both ends. Most common failure: Zoho org timezone vs Worker UTC drift. Use `zoho.currenttime.toString("...","UTC")` explicitly and parse to epoch ms. Reject if drift > 5 min.
+
+3. **End-to-end single-Lead enrichment.** Create test Lead, ensure `email_hash` for that Lead's email exists in KV (submit a test form first, or seed via signed POST), manually invoke `enrichLeadFromKV(test_lead_id)`, verify all 23 `pve_*` fields populate. Re-run on same Lead, verify fence returns `"already populated"`. Set `ENRICH_ENABLED=false`, re-run, verify returns `"disabled"`.
 
 ---
 
@@ -263,7 +272,6 @@ worker/
 deluge/
   enrich_lead_from_kv.dg
   daily_sweep.dg
-  backfill.dg
 gtm/
   pve_attribution_unified.html       # live, sets cookies
   pve_identify.html                  # new, universal email listener
@@ -291,10 +299,11 @@ Deluge functions and GTM tag: source of truth in repo. Manual copy/paste into Zo
 
 ## Operational baseline
 
-### Observability
+### Observability (live from Step 3 publish)
+- Counters wired into Worker code at Step 2 so they emit from the first POST. Logpush + Logs UI ready before Step 3 publishes the GTM tag (otherwise we miss the most informative window of the warmup).
 - Cloudflare Logpush enabled, destination R2 (or Cloudflare Logs).
 - Worker logs structured counters: `identify_200`, `identify_400`, `identify_403_turnstile`, `identify_429_ratelimit`, `kv_write_fail`, `lookup_404`, `lookup_5xx`.
-- Weekly review of: Turnstile reject rate, 5xx rate, rate-limit drops.
+- Weekly review (post go-live) of: Turnstile reject rate, 5xx rate, rate-limit drops.
 - Deluge: log `invokeurl` failures with `email_hash` (not email) and `lead_id` for triage.
 
 ### KV backup
