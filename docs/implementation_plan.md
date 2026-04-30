@@ -211,7 +211,7 @@ Verification before Conversion Mapping: confirm each Lead field and its Contact 
 5. Build HMAC payload: `"GET\n/lookup\nemail_hash=" + email_hash + "\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n" + utc_epoch_ms`.
 6. `signature = zoho.encryption.hmacsha256(secret, payload, "hex")`.
 7. `invokeurl GET https://ss.vacuumelevators.com/lookup?email_hash=<hex>` with `X-Signature` and `X-Timestamp` headers.
-8. On 200: update Lead with all 23 `pve_*` fields from response.
+8. On 200: build update Map from response. **Allowlist guardrail:** every key in the Map MUST match `^pve_`. If any key fails, abort and log (no Lead update). Then update Lead with the Map.
 9. On 404, 5xx, or timeout: log and return. **No retry inside the workflow.** Workflow-triggered Deluge is capped at 30 seconds total execution; the daily sweep absorbs failures.
 
 #### `dailySweep()` (scheduled 03:00 UTC, Schedule trigger budget = 15 min)
@@ -224,7 +224,8 @@ Verification before Conversion Mapping: confirm each Lead field and its Contact 
 1. Iterate all Leads with any `KDI_*` field populated.
 2. For each `pve_*` target field, write only if currently empty (additive; protects against overwrite during parallel run).
 3. 1:1 mapping for the 14 cookie-derived fields. The 9 Worker/Cloudflare-derived fields stay empty for historical Leads (cannot be reconstructed).
-4. Idempotent: re-running on partial completion only fills missing fields.
+4. **Allowlist guardrail:** every key in the update Map MUST match `^pve_`. If any key fails, abort the Lead update and log.
+5. Idempotent: re-running on partial completion only fills missing fields.
 
 ### 6. Workflow Rules
 
