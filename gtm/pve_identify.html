@@ -1,0 +1,228 @@
+<script>
+/**
+ * PVE Identify Tag, GTM Custom HTML
+ *
+ * Role:
+ *   On every page, install passive listeners for email capture and form
+ *   submit. When a form is submitted, hash the email (SHA-256) and POST
+ *   attribution payload to the Cloudflare Worker at
+ *   https://ss.vacuumelevators.com/identify. The Worker writes/merges a
+ *   KV entry keyed by the email hash.
+ *
+ *   Pairs with PVE Attribution Unified (writes pve_fc_* / pve_lc_* /
+ *   pve_gclid cookies). This tag READS those cookies; it does not write.
+ *
+ * Failsafe principles:
+ *   - Listeners are passive: never preventDefault, stopPropagation, or
+ *     return false. The form's native flow is never interrupted.
+ *   - Try/catch wraps everything. Any error = silent fail. Page never
+ *     breaks because of this tag.
+ *   - fetch uses keepalive:true so the request survives form redirects
+ *     (no need for beforeunload + sendBeacon).
+ *
+ * Trigger: All Pages.
+ *
+ * Worker schema (verified against worker/src/handlers/identify.js):
+ *   {
+ *     turnstile_token,
+ *     email_hash,
+ *     first_touch: { source, medium, campaign, content, term, referrer, landing_page, ts },
+ *     last_touch:  { same shape },
+ *     gclid,
+ *     ga_raw
+ *   }
+ *   Note: touches[] is derived server-side from last_touch. Do not send.
+ */
+
+(function () {
+
+  /* -------- Config -------- */
+
+  var TURNSTILE_SITE_KEY = '0x4AAAAAADFvwb7blUye0-XV';
+  var ENDPOINT = 'https://ss.vacuumelevators.com/identify';
+  var TURNSTILE_API = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+
+  /* -------- State -------- */
+
+  var lastSeenEmail = '';
+  var sent = false;     /* long-term lock: success POST landed */
+  var sending = false;  /* short-term lock: send() in flight */
+  var turnstileLoading = null;
+
+  /* -------- Helpers -------- */
+
+  function getCookie(name) {
+    var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
+  function normalizeEmail(s) {
+    return String(s || '').trim().toLowerCase();
+  }
+
+  function looksLikeEmail(s) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+  }
+
+  async function sha256Hex(str) {
+    var enc = new TextEncoder().encode(str);
+    var buf = await crypto.subtle.digest('SHA-256', enc);
+    var bytes = new Uint8Array(buf);
+    var hex = '';
+    for (var i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, '0');
+    }
+    return hex;
+  }
+
+  function readTouchCookies(prefix) {
+    return {
+      source:        getCookie(prefix + 'source'),
+      medium:        getCookie(prefix + 'medium'),
+      campaign:      getCookie(prefix + 'campaign'),
+      content:       getCookie(prefix + 'content'),
+      term:          getCookie(prefix + 'term'),
+      referrer:      getCookie(prefix + 'referrer'),
+      landing_page:  getCookie(prefix + 'landing_page'),
+      ts:            Date.now()
+    };
+  }
+
+  /* -------- Turnstile -------- */
+
+  /* Load the Turnstile script once. Returns a Promise that resolves when
+     window.turnstile is available. */
+  function loadTurnstile() {
+    if (window.turnstile) return Promise.resolve();
+    if (turnstileLoading) return turnstileLoading;
+    turnstileLoading = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = TURNSTILE_API;
+      s.async = true;
+      s.defer = true;
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('turnstile_load_fail')); };
+      document.head.appendChild(s);
+    });
+    return turnstileLoading;
+  }
+
+  /* Render an invisible widget and resolve with a token. Each call creates
+     a fresh hidden container; widget is removed after token returns. */
+  function getTurnstileToken() {
+    return loadTurnstile().then(function () {
+      return new Promise(function (resolve, reject) {
+        var container = document.createElement('div');
+        container.style.display = 'none';
+        document.body.appendChild(container);
+        var widgetId = window.turnstile.render(container, {
+          sitekey: TURNSTILE_SITE_KEY,
+          size: 'invisible',
+          callback: function (token) {
+            resolve(token);
+            try { window.turnstile.remove(widgetId); } catch (e) {}
+            try { container.remove(); } catch (e) {}
+          },
+          'error-callback': function () {
+            reject(new Error('turnstile_error'));
+            try { container.remove(); } catch (e) {}
+          },
+          'timeout-callback': function () {
+            reject(new Error('turnstile_timeout'));
+            try { container.remove(); } catch (e) {}
+          }
+        });
+      });
+    });
+  }
+
+  /* -------- Email capture -------- */
+
+  /* Listen for changes on email-type inputs. Stash the latest value.
+     Bubble phase, read-only. */
+  function onChange(e) {
+    try {
+      var t = e.target;
+      if (t && t.tagName === 'INPUT' && t.type === 'email') {
+        var v = normalizeEmail(t.value);
+        if (looksLikeEmail(v)) lastSeenEmail = v;
+      }
+    } catch (err) { /* silent */ }
+  }
+
+  /* Fallback: scan the form for an email input at submit time. Covers
+     autofill flows that don't fire change. */
+  function findEmailInForm(form) {
+    try {
+      if (!form || !form.querySelectorAll) return '';
+      var inputs = form.querySelectorAll('input[type="email"]');
+      for (var i = 0; i < inputs.length; i++) {
+        var v = normalizeEmail(inputs[i].value);
+        if (looksLikeEmail(v)) return v;
+      }
+    } catch (err) {}
+    return '';
+  }
+
+  /* -------- Send -------- */
+
+  async function send(email) {
+    /* Two-flag guard against the submit + ff_submit race:
+       `sending` blocks concurrent calls while a send is in flight,
+       `sent` blocks all calls after a successful POST landed. */
+    if (sent || sending) return;
+    sending = true;
+    try {
+      var normalized = normalizeEmail(email);
+      if (!looksLikeEmail(normalized)) return;
+
+      var hash = await sha256Hex(normalized);
+      var token = await getTurnstileToken();
+
+      var payload = {
+        turnstile_token: token,
+        email_hash: hash,
+        first_touch: readTouchCookies('pve_fc_'),
+        last_touch:  readTouchCookies('pve_lc_'),
+        gclid:       getCookie('pve_gclid'),
+        ga_raw:      getCookie('_ga')
+      };
+
+      var res = await fetch(ENDPOINT, {
+        method: 'POST',
+        mode: 'cors',
+        credentials: 'omit',
+        keepalive: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (res && res.ok) sent = true;
+    } catch (err) { /* silent */ }
+    finally {
+      sending = false;
+    }
+  }
+
+  /* -------- Submit listeners -------- */
+
+  function onSubmit(e) {
+    try {
+      var form = e && e.target;
+      var email = lastSeenEmail || findEmailInForm(form);
+      if (email) send(email);
+    } catch (err) { /* silent */ }
+  }
+
+  /* -------- Wire up -------- */
+
+  try {
+    document.addEventListener('change', onChange, false);
+    document.addEventListener('submit', onSubmit, false);
+    /* Fluent Forms emits a non-standard 'ff_submit' event after its AJAX
+       submit completes. Catching both ensures we don't miss either path. */
+    document.addEventListener('ff_submit', onSubmit, false);
+  } catch (err) { /* silent */ }
+
+})();
+</script>
