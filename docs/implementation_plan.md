@@ -139,16 +139,21 @@ This is the DSAR mechanism. TTL is retention hygiene only, not a deletion right.
 
 #### Channel derivation
 
-| Medium | Channel |
-|---|---|
-| `cpc`, `paid`, `paid_search`, `ppc` | Paid Search |
-| `paid_social`, `paidsocial`, `social_paid` | Paid Social |
-| `email` | Email |
-| `organic` | Organic Search |
-| `referral` | Referral |
-| `display` | Display |
-| `(none)`, empty | Direct |
-| else | Other |
+Source-aware: when medium is paid (cpc/paid/ppc/paid_search/paidsearch), the source distinguishes Paid Search from Paid Social. Mirrors GA Connector behavior (Lead 131454 reference: source=facebook + medium=cpc → Paid Social, not Paid Search).
+
+Rules evaluated top-to-bottom, first match wins:
+
+| Medium | Source | → Channel |
+|---|---|---|
+| `cpc`, `paid`, `paid_search`, `paidsearch`, `ppc` | facebook, fb, instagram, ig, linkedin, twitter, x, tiktok, snapchat, pinterest, reddit | Paid Social |
+| `cpc`, `paid`, `paid_search`, `paidsearch`, `ppc` | else | Paid Search |
+| `paid_social`, `paidsocial`, `social_paid`, `social-paid` | (any) | Paid Social |
+| `email` | (any) | Email |
+| `organic` | (any) | Organic Search |
+| `referral` | (any) | Referral |
+| `display` | (any) | Display |
+| `(none)` or empty | (any) | Direct |
+| anything else | (any) | Other |
 
 ### 3. Cloudflare KV
 
