@@ -1,0 +1,49 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - '.github/workflows/deploy_worker.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: worker
+
+      - name: Lint
+        run: npm run lint
+        working-directory: worker
+
+      - name: Test
+        run: npm run test
+        working-directory: worker
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+
+      - name: Post-deploy smoke test
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://ss.vacuumelevators.com/)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Smoke test failed: GET / returned $STATUS"
+            exit 1
+          fi
+          echo "Smoke test passed: GET / returned $STATUS"
