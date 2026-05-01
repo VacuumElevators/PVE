@@ -279,7 +279,7 @@ deluge/
   daily_sweep.dg
 gtm/
   pve_attribution_unified.html       # live, sets cookies
-  pve_identify.html                  # new, universal email listener
+  pve_attribution_send_to_kv_gtm_tag.html  # new, universal email listener (GTM tag: "PVE attribution - Send to KV")
 docs/
   implementation_plan.md
   runbook.md                         # deploy, rollback, restore procedures

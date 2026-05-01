@@ -64,15 +64,18 @@
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
   }
 
-  async function sha256Hex(str) {
+  /* GTM's Custom HTML compiler rejects async/await (ES2017+). All async
+     work uses explicit Promise chains. Promise constructor itself is OK. */
+  function sha256Hex(str) {
     var enc = new TextEncoder().encode(str);
-    var buf = await crypto.subtle.digest('SHA-256', enc);
-    var bytes = new Uint8Array(buf);
-    var hex = '';
-    for (var i = 0; i < bytes.length; i++) {
-      hex += bytes[i].toString(16).padStart(2, '0');
-    }
-    return hex;
+    return crypto.subtle.digest('SHA-256', enc).then(function (buf) {
+      var bytes = new Uint8Array(buf);
+      var hex = '';
+      for (var i = 0; i < bytes.length; i++) {
+        hex += bytes[i].toString(16).padStart(2, '0');
+      }
+      return hex;
+    });
   }
 
   function readTouchCookies(prefix) {
@@ -166,42 +169,39 @@
 
   /* -------- Send -------- */
 
-  async function send(email) {
+  function send(email) {
     /* Two-flag guard against the submit + ff_submit race:
        `sending` blocks concurrent calls while a send is in flight,
        `sent` blocks all calls after a successful POST landed. */
     if (sent || sending) return;
     sending = true;
-    try {
-      var normalized = normalizeEmail(email);
-      if (!looksLikeEmail(normalized)) return;
 
-      var hash = await sha256Hex(normalized);
-      var token = await getTurnstileToken();
+    var normalized = normalizeEmail(email);
+    if (!looksLikeEmail(normalized)) { sending = false; return; }
 
-      var payload = {
-        turnstile_token: token,
-        email_hash: hash,
-        first_touch: readTouchCookies('pve_fc_'),
-        last_touch:  readTouchCookies('pve_lc_'),
-        gclid:       getCookie('pve_gclid'),
-        ga_raw:      getCookie('_ga')
-      };
-
-      var res = await fetch(ENDPOINT, {
-        method: 'POST',
-        mode: 'cors',
-        credentials: 'omit',
-        keepalive: true,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+    sha256Hex(normalized).then(function (hash) {
+      return getTurnstileToken().then(function (token) {
+        var payload = {
+          turnstile_token: token,
+          email_hash: hash,
+          first_touch: readTouchCookies('pve_fc_'),
+          last_touch:  readTouchCookies('pve_lc_'),
+          gclid:       getCookie('pve_gclid'),
+          ga_raw:      getCookie('_ga')
+        };
+        return fetch(ENDPOINT, {
+          method: 'POST',
+          mode: 'cors',
+          credentials: 'omit',
+          keepalive: true,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
       });
-
+    }).then(function (res) {
       if (res && res.ok) sent = true;
-    } catch (err) { /* silent */ }
-    finally {
-      sending = false;
-    }
+    })['catch'](function (err) { /* silent */ })
+      .then(function () { sending = false; });
   }
 
   /* -------- Submit listeners -------- */
